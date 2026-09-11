@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+# cgo IS required here (yalue/onnxruntime_go's dlopen shim is a cgo file on
+# every platform -- see CI's comment), so unlike a pure-Go project this
+# can't cross-compile every target from one runner: cgo needs a matching
+# C toolchain per target OS/arch. No native library gets linked beyond
+# libc/libdl though (ONNX Runtime itself is dlopen'd at runtime), so there's
+# no static-linking step to do here, unlike kitten-tts-go's opus build --
+# just `go build` on the right runner per target.
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64, cross: false }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64, cross: false }
+          # darwin/amd64 is cross-compiled on the arm64 runner (clang -arch x86_64).
+          - { runner: macos-latest, goos: darwin, goarch: amd64, cross: true }
+          - { runner: macos-latest, goos: darwin, goarch: arm64, cross: false }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history (tags) for version derivation
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            export CC="clang -arch x86_64"
+          fi
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/kitten-asr ./cmd/kitten-asr
+          go build -trimpath -ldflags "-s -w" -o dist/kitten-asr-server ./cmd/kitten-asr-server
+          file dist/* || true
+
+      - name: Package archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          pkg="kitten-asr-go_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir -p "staging/${pkg}"
+          cp dist/kitten-asr dist/kitten-asr-server "staging/${pkg}/"
+          cp README.md LICENSE "staging/${pkg}/"
+          tar -C staging -czf "${pkg}.tar.gz" "${pkg}"
+          ls -la "${pkg}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  # Collect every platform's archive, checksum them, and publish one Release.
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/checksums.txt
+          generate_release_notes: true

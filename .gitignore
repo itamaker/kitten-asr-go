@@ -1,0 +1,9 @@
+/bin/
+/dist/
+/models/
+*.wav
+*.mp3
+*.flac
+*.pcm
+__pycache__/
+*.pyc

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # cgo IS required to build (yalue/onnxruntime_go's dlopen shim is a
+      # cgo file even on every platform -- CGO_ENABLED=0 fails with "build
+      # constraints exclude all Go files"), but nothing beyond libc/libdl
+      # gets linked: ONNX Runtime itself is still dlopen'd at runtime, not
+      # linked at build time. Default CGO_ENABLED (1, since these runners
+      # have a C compiler) is all that's needed -- no extra system packages.
+      - name: Build
+        run: go build -o bin/ ./...
+
+      # Go tests need no model directory or ONNX Runtime install -- they
+      # check the pure-Go pieces (tokenizer, mel spectrogram) against
+      # reference outputs committed under asr/testdata_*.
+      - name: Test
+        run: go test -v -race ./...
