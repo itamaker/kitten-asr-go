@@ -83,17 +83,20 @@ export ONNXRUNTIME_LIB_PATH=/path/to/libonnxruntime.so
 
 ## Available Models
 
-| Model | Parameters | Original weights (HF) | ONNX export used by this repo |
-|---|---|---|---|
-| kitten-asr-tiny | 471M | [KittenML/kitten-asr-tiny](https://huggingface.co/KittenML/kitten-asr-tiny) | [zhaoyang-jia/kitten-asr-tiny-onnx](https://huggingface.co/zhaoyang-jia/kitten-asr-tiny-onnx) (1.9 GB) |
-| kitten-asr-small-enhanced | 782M | [KittenML/kitten-asr-small-enhanced](https://huggingface.co/KittenML/kitten-asr-small-enhanced) | [zhaoyang-jia/kitten-asr-small-enhanced-onnx](https://huggingface.co/zhaoyang-jia/kitten-asr-small-enhanced-onnx) (3.8 GB) |
+| Model | Parameters | Original weights (HF) | ONNX export (fp32) | ONNX export (int8) |
+|---|---|---|---|---|
+| kitten-asr-tiny | 471M | [KittenML/kitten-asr-tiny](https://huggingface.co/KittenML/kitten-asr-tiny) | [zhaoyang-jia/kitten-asr-tiny-onnx](https://huggingface.co/zhaoyang-jia/kitten-asr-tiny-onnx) | [zhaoyang-jia/kitten-asr-tiny-onnx-int8](https://huggingface.co/zhaoyang-jia/kitten-asr-tiny-onnx-int8) |
+| kitten-asr-small-enhanced | 782M | [KittenML/kitten-asr-small-enhanced](https://huggingface.co/KittenML/kitten-asr-small-enhanced) | [zhaoyang-jia/kitten-asr-small-enhanced-onnx](https://huggingface.co/zhaoyang-jia/kitten-asr-small-enhanced-onnx) | [zhaoyang-jia/kitten-asr-small-enhanced-onnx-int8](https://huggingface.co/zhaoyang-jia/kitten-asr-small-enhanced-onnx-int8) |
 
 The "Original weights" repos are KittenML's own, upstream — that's where the
 `tools/` pipeline below reads from. The "ONNX export" repos are this
 project's own conversion of those weights, and what `fetch_model.sh` and the
-Go engine actually consume. The ONNX export is bigger than the original
-weights because it's fp32 (ONNX Runtime's dynamo exporter doesn't handle
-bf16 well); the originals ship as bf16 safetensors.
+Go engine actually consume (fp32 by default; `fetch_model.sh` doesn't fetch
+the int8 ones yet -- see "Dynamic int8 quantization" below for how to
+produce or grab them, and read its measured tradeoff before reaching for
+int8 over fp32). The fp32 export is bigger than the original weights because
+ONNX Runtime's dynamo exporter doesn't handle bf16 well, so it's exported as
+fp32; the originals ship as bf16 safetensors.
 
 ### Downloading a model
 
