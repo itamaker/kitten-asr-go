@@ -84,15 +84,30 @@ def empty_kv():
     return feed
 
 
+def project(raw_first_output):
+    """raw_first_output: decoder_sess's first output, (1, 1, X). Returns the
+    (vocab_size,) logits for the single generated position -- read directly
+    when X is already vocab_size (untied models bake lm_head into the graph),
+    or projected through embed_tokens when X is hidden_size instead (tied
+    models: lm_head.weight *is* embed_tokens.weight, so the graph stops at
+    the hidden state and leaves this projection to the caller -- see
+    decoder_wrapper.DecoderStep's project_logits doc comment, mirrored on the
+    Go side by asr.Model.projectLogits)."""
+    row = raw_first_output[0, -1]  # (X,)
+    if tc.tie_word_embeddings:
+        return embed_tokens @ row  # (vocab_size, hidden) @ (hidden,) -> (vocab_size,)
+    return row
+
+
 kv_feed = empty_kv()
 attention_mask = np.ones((1, inputs_embeds.shape[1]), dtype=np.int64)
 
 feed = {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask, **kv_feed}
 outputs = decoder_sess.run(None, feed)
-logits, present = outputs[0], outputs[1:]
+logits, present = project(outputs[0]), outputs[1:]
 
 generated = []
-next_id = int(logits[0, -1].argmax())
+next_id = int(logits.argmax())
 MAX_NEW = 100
 for step in range(MAX_NEW):
     generated.append(next_id)
@@ -106,8 +121,8 @@ for step in range(MAX_NEW):
         kv_feed[f"past_value_{i}"] = present[2 * i + 1]
     feed = {"inputs_embeds": next_embed, "attention_mask": attention_mask, **kv_feed}
     outputs = decoder_sess.run(None, feed)
-    logits, present = outputs[0], outputs[1:]
-    next_id = int(logits[0, -1].argmax())
+    logits, present = project(outputs[0]), outputs[1:]
+    next_id = int(logits.argmax())
 
 print("\n=== ONNX-ONLY PIPELINE RESULT ===")
 print("tokens:", generated)

@@ -35,9 +35,16 @@ def main():
     model.model.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config.text_config)
     model.eval()
 
-    wrapper = DecoderStep(model)
-    wrapper.eval()
     tc = config.text_config
+    # A tied model's lm_head.weight *is* embed_tokens.weight (re-tied above
+    # by load_checkpoint_weights) -- baking it into this graph too would
+    # duplicate that whole matrix on disk for nothing, since
+    # export_embed_tokens.py already dumps it separately and the Go runtime
+    # projects with that copy instead (see decoder_wrapper.DecoderStep's
+    # project_logits doc comment, and asr.Model.projectLogits on the Go side).
+    project_logits = not tc.tie_word_embeddings
+    wrapper = DecoderStep(model, project_logits=project_logits)
+    wrapper.eval()
     num_layers = tc.num_hidden_layers
 
     # Sample inputs: a "mid-generation" shape (some past, one new token) exercises
@@ -50,16 +57,17 @@ def main():
         past_kv.append(torch.randn(1, tc.num_key_value_heads, PAST_LEN, tc.head_dim))
         past_kv.append(torch.randn(1, tc.num_key_value_heads, PAST_LEN, tc.head_dim))
 
+    first_output_name = "logits" if project_logits else "hidden_states"
     with torch.no_grad():
         ref_out = wrapper(inputs_embeds, attention_mask, *past_kv)
-    print("PyTorch logits shape:", ref_out[0].shape, "num kv outputs:", len(ref_out) - 1)
+    print(f"PyTorch {first_output_name} shape:", ref_out[0].shape, "num kv outputs:", len(ref_out) - 1)
 
     seq_len_dim = torch.export.Dim("seq_len", min=1, max=4096)
     past_len_dim = torch.export.Dim("past_len", min=0, max=65536)
     total_len_dim = torch.export.Dim("total_len", min=1, max=65536 + 4096)
 
     input_names = ["inputs_embeds", "attention_mask"]
-    output_names = ["logits"]
+    output_names = [first_output_name]
     past_kv_shapes = []
     for i in range(num_layers):
         input_names += [f"past_key_{i}", f"past_value_{i}"]
@@ -92,8 +100,8 @@ def main():
         feed[f"past_key_{i}"] = past_kv[2 * i].numpy()
         feed[f"past_value_{i}"] = past_kv[2 * i + 1].numpy()
     ort_outs = sess.run(None, feed)
-    logit_diff = np.abs(ort_outs[0] - ref_out[0].detach().numpy())
-    print("logits max abs diff PyTorch vs ONNXRuntime:", logit_diff.max(), "mean:", logit_diff.mean())
+    first_diff = np.abs(ort_outs[0] - ref_out[0].detach().numpy())
+    print(f"{first_output_name} max abs diff PyTorch vs ONNXRuntime:", first_diff.max(), "mean:", first_diff.mean())
     kv_max = max(
         np.abs(ort_outs[1 + i] - ref_out[1 + i].detach().numpy()).max() for i in range(2 * num_layers)
     )

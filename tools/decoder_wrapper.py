@@ -9,10 +9,27 @@ from transformers.cache_utils import DynamicCache
 
 
 class DecoderStep(torch.nn.Module):
-    def __init__(self, thinker_model):
+    def __init__(self, thinker_model, project_logits: bool = True):
+        """project_logits selects whether this graph bakes lm_head's
+        projection to vocab space in, or stops at the raw hidden state and
+        leaves the projection to the caller.
+
+        Pass False when thinker_model.config.text_config.tie_word_embeddings
+        is set: there, lm_head.weight *is* embed_tokens.weight (re-tied by
+        load_and_check.load_checkpoint_weights), so baking lm_head into this
+        graph too would duplicate that whole (vocab_size x hidden_size)
+        matrix on disk for no benefit -- the caller already has
+        embed_tokens.weight from export_embed_tokens.py's separate dump and
+        can project with that instead (see kitten-asr-go's
+        Model.projectLogits). For an untied model (tie_word_embeddings=False,
+        e.g. kitten-asr-tiny) lm_head.weight is a distinct matrix with no
+        other export capturing it, so it must stay baked in here -- leave
+        project_logits at its default True.
+        """
         super().__init__()
         self.text_model = thinker_model.model
-        self.lm_head = thinker_model.lm_head
+        self.lm_head = thinker_model.lm_head if project_logits else None
+        self.project_logits = project_logits
         self.num_layers = thinker_model.config.text_config.num_hidden_layers
 
     def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, *past_kv: torch.Tensor):
@@ -28,17 +45,21 @@ class DecoderStep(torch.nn.Module):
         )
         # Only the next-token prediction is ever used (both the caller's
         # prefill and single-token decode steps only read the last position's
-        # logits) -- projecting every prompt position through lm_head
-        # (hidden_size x vocab_size, vocab_size=151936) is pure waste on a
-        # multi-token prefill and was most of this graph's runtime.
+        # logits/hidden state) -- carrying forward every prompt position
+        # (hidden_size x seq_len) is pure waste on a multi-token prefill and
+        # was most of this graph's runtime.
         last_hidden = out.last_hidden_state[:, -1:, :]
-        logits = self.lm_head(last_hidden)
+        # (hidden_size x vocab_size, vocab_size=151936) is itself a
+        # significant chunk of runtime for a single-position input -- see
+        # project_logits' doc comment above for why it's sometimes skipped
+        # here entirely rather than just moved off the multi-position path.
+        result = self.lm_head(last_hidden) if self.project_logits else last_hidden
 
         new_kv = []
         for i in range(self.num_layers):
             new_kv.append(cache.layers[i].keys)
             new_kv.append(cache.layers[i].values)
-        return (logits, *new_kv)
+        return (result, *new_kv)
 
 
 def empty_past_kv(config, batch=1, device="cpu", dtype=torch.float32):
