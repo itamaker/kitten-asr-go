@@ -1,6 +1,8 @@
 /bin/
 /dist/
 /models/
+/.venv/
+/.pipcache/
 *.wav
 *.mp3
 *.flac

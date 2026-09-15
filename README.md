@@ -130,7 +130,56 @@ cp <same-path>/{config.json,vocab.json,merges.txt,added_tokens.json} <out>/
 `fetch_model.sh` downloads. The same steps work unmodified for
 `kitten-asr-small-enhanced` (point at its downloaded directory instead, and
 use a `kitten_asr_small_enhanced_` prefix instead so the two models' files
-stay distinguishable if they ever end up in the same directory).
+stay distinguishable if they ever end up in the same directory) — including
+`export_decoder.py` automatically skipping the redundant lm_head projection
+for it (it ties `lm_head.weight` to `embed_tokens.weight`, unlike tiny), so
+its `decoder.onnx` doesn't duplicate the ~600MB tied matrix that
+`export_embed_tokens.py` already dumps separately; `asr.Model` reuses that
+copy for the final vocab projection at runtime instead (see
+`Model.projectLogits` and `config.TieWordEmbeddings`).
+
+### Dynamic int8 quantization
+
+`tools/quantize.py` produces an int8 copy of a model directory using ONNX
+Runtime's built-in dynamic quantization (weights stored as int8, activations
+quantized on the fly at inference time — no calibration dataset needed):
+
+```bash
+python3 tools/quantize.py models/kitten-asr-tiny-onnx models/kitten-asr-tiny-onnx-int8
+```
+
+The output is a complete, independent model directory in the same shape
+`fetch_model.sh` produces (`asr.New` loads it exactly the same way) — only
+`*_audio_encoder.onnx` and `*_decoder.onnx` (plus its external-data
+companion) are quantized; `embed_tokens.bin` is a plain lookup table, not a
+compute graph, so quantizing it would only save load-time I/O, not inference
+compute, and is left as-is.
+
+Measured against kitten-asr-tiny (real transcription via the Go runtime, not
+just a Python-side check):
+
+| graph | fp32 | int8 | ratio |
+|---|---|---|---|
+| audio_encoder | 384.3 MB | 100.1 MB | 3.8x smaller |
+| decoder | 1198.1 MB | 303.7 MB | 3.9x smaller |
+
+That's the whole story for disk size, but it's not a free lunch:
+transcribing a 6-item synthetic eval set (five short sentences plus a ~90s
+paragraph, all espeak-ng-synthesized so exact reference text is known) came
+out to **20.7% WER fp32 vs. 27.8% WER int8** — a real, non-trivial accuracy
+cost, not noise (66 vs. 49 word-level edits out of 237 reference words) —
+for **no measurable speed difference** (100.95s vs. 99.32s total wall time
+across all 6 items, CPU-only, `DefaultIntraOpThreads`). Dynamic quantization
+shrinks the weights on disk, but ONNX Runtime's CPU dynamic-quantized matmul
+kernels here aren't meaningfully faster than its float32 ones, and the
+quantization error measurably hurts recognition accuracy on top. So treat
+this as a **disk/download-size tool, not a speed or default-inference
+optimization** — reach for it when shipping a smaller model to bandwidth- or
+storage-constrained deployments matters more than a few extra points of
+accuracy, not as something to enable by default. (Only measured on
+kitten-asr-tiny and on synthetic espeak-ng audio; small-enhanced and
+real-world speech weren't benchmarked here but the tool works the same way
+against either model.)
 
 ## Build
 
