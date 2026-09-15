@@ -98,7 +98,7 @@ func New(dir string, opts ...Option) (*Model, error) {
 		encoder.Close()
 		return nil, err
 	}
-	decoder, err := loadTextDecoder(decoderPath, cfg.NumLayers, cfg.NumKVHeads, cfg.HeadDim, o.intraOpThreads)
+	decoder, err := loadTextDecoder(decoderPath, cfg.NumLayers, cfg.NumKVHeads, cfg.HeadDim, cfg.TieWordEmbeddings, o.intraOpThreads)
 	if err != nil {
 		encoder.Close()
 		return nil, err

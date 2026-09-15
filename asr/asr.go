@@ -2,7 +2,10 @@ package asr
 
 import (
 	"fmt"
+	"math"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 // MaxAudioSeconds is the model's hard per-window limit: the audio tower's
@@ -23,14 +26,19 @@ type Result struct {
 
 // Transcribe recognizes speech in samples (mono, at inputSampleRate Hz) and
 // returns the transcript. Audio longer than MaxAudioSeconds is split into
-// consecutive (non-overlapping) MaxAudioSeconds chunks, each transcribed
-// independently and joined with a space -- the model has no notion of
-// carrying context between chunks or of precise word timing, so a chunk
-// boundary landing mid-word or mid-sentence can cost a little accuracy right
-// at the cut. Good enough for a first pass; real long-form handling (as in
-// Whisper's own sliding-window algorithm) would need timestamp-aware
-// resegmentation this model doesn't support. Not goroutine-safe -- see
-// Model's doc comment.
+// consecutive (non-overlapping) chunks of at most MaxAudioSeconds, each
+// transcribed independently and joined with a space. Interior boundaries are
+// nudged earlier, onto the quietest point chunkCut can find in the last
+// chunkCutSearchSeconds before the hard limit (see its doc comment) -- a
+// cheap short-term-energy scan, not a trained VAD model, so it still cuts
+// mid-word whenever the whole margin is loud (e.g. continuous speech with no
+// nearby pause). The model also has no notion of carrying context between
+// chunks or of precise word timing, so even a well-placed cut can cost a
+// little accuracy right at the boundary -- that part is a model limitation,
+// not something a smarter cut point can fix. Good enough for a first pass;
+// real long-form handling (as in Whisper's own sliding-window algorithm)
+// would need timestamp-aware resegmentation this model doesn't support. Not
+// goroutine-safe -- see Model's doc comment.
 func (m *Model) Transcribe(samples []float32, inputSampleRate int) (Result, error) {
 	if inputSampleRate != sampleRate {
 		samples = Resample(samples, inputSampleRate, sampleRate)
@@ -42,11 +50,12 @@ func (m *Model) Transcribe(samples []float32, inputSampleRate int) (Result, erro
 
 	var texts []string
 	language := ""
-	for start := 0; start < len(samples); start += numSamples {
-		end := start + numSamples
-		if end > len(samples) {
-			end = len(samples)
+	for start := 0; start < len(samples); {
+		hardEnd := start + numSamples
+		if hardEnd > len(samples) {
+			hardEnd = len(samples)
 		}
+		end := chunkCut(samples, start, hardEnd)
 		res, err := m.transcribeChunk(samples[start:end])
 		if err != nil {
 			return Result{}, fmt.Errorf("asr: chunk at %.1fs: %w", float64(start)/float64(sampleRate), err)
@@ -57,8 +66,58 @@ func (m *Model) Transcribe(samples []float32, inputSampleRate int) (Result, erro
 		if language == "" {
 			language = res.Language
 		}
+		start = end
 	}
 	return Result{Language: language, Text: strings.Join(texts, " ")}, nil
+}
+
+// chunkCutSearchSeconds is how far before a hard chunk boundary chunkCut
+// searches for a quieter cut point.
+const chunkCutSearchSeconds = 2.0
+
+// chunkCutFrameSamples is chunkCut's short-term-energy analysis frame size
+// (20ms at 16kHz).
+const chunkCutFrameSamples = sampleRate / 50
+
+// chunkCutStepSamples is chunkCut's scan hop (50% frame overlap).
+const chunkCutStepSamples = chunkCutFrameSamples / 2
+
+// chunkCut returns where Transcribe should end the chunk starting at
+// samples[start:], given a hard upper bound hardEnd (start+numSamples, or
+// len(samples) if that's smaller). The result is always in [start, hardEnd].
+//
+// If hardEnd is already the true end of the audio there's nothing to gain by
+// moving it, so it's returned unchanged. Otherwise chunkCut scans the last
+// chunkCutSearchSeconds before hardEnd in chunkCutFrameSamples-sized frames
+// and returns the start of whichever frame has the lowest RMS energy -- the
+// most silence-like point in that margin, and therefore the least likely to
+// land mid-word. It falls back to hardEnd itself only when the search window
+// is too short to contain two frames (a final chunk barely over numSamples).
+func chunkCut(samples []float32, start, hardEnd int) int {
+	if hardEnd >= len(samples) {
+		return hardEnd
+	}
+	searchStart := hardEnd - int(chunkCutSearchSeconds*sampleRate)
+	if searchStart < start {
+		searchStart = start
+	}
+	if hardEnd-searchStart < 2*chunkCutFrameSamples {
+		return hardEnd
+	}
+
+	bestPos := hardEnd
+	bestEnergy := math.Inf(1)
+	for pos := searchStart; pos+chunkCutFrameSamples <= hardEnd; pos += chunkCutStepSamples {
+		var energy float64
+		for _, s := range samples[pos : pos+chunkCutFrameSamples] {
+			energy += float64(s) * float64(s)
+		}
+		if energy < bestEnergy {
+			bestEnergy = energy
+			bestPos = pos
+		}
+	}
+	return bestPos
 }
 
 // transcribeChunk runs the model on a single window of at most
@@ -100,11 +159,11 @@ func (m *Model) transcribeChunk(samples []float32) (Result, error) {
 	}
 	defer cache.Destroy()
 
-	// decoder.Step's ONNX graph only ever projects the *last* position through
-	// lm_head (see tools/decoder_wrapper.py), so logits is always exactly one
-	// vocabSize-length row regardless of how many tokens were fed in -- no
-	// slicing needed, unlike a graph that returned logits for every position.
-	logits, err := m.decoder.Step(cache, inputsEmbeds, len(promptIDs), m.cfg.HiddenSize)
+	// decoder.Step's ONNX graph only ever carries the *last* position forward
+	// (see tools/decoder_wrapper.py), so its result is always exactly one row
+	// regardless of how many tokens were fed in -- no slicing needed, unlike a
+	// graph that returned a row for every position.
+	logits, err := m.decodeStep(cache, inputsEmbeds, len(promptIDs))
 	if err != nil {
 		return Result{}, fmt.Errorf("asr: decoder prefill: %w", err)
 	}
@@ -117,7 +176,7 @@ func (m *Model) transcribeChunk(samples []float32) (Result, error) {
 		if nextID == m.cfg.EOSTokenID {
 			break
 		}
-		logits, err = m.decoder.Step(cache, m.embedRow(nextID), 1, m.cfg.HiddenSize)
+		logits, err = m.decodeStep(cache, m.embedRow(nextID), 1)
 		if err != nil {
 			return Result{}, fmt.Errorf("asr: decoder step %d: %w", step, err)
 		}
@@ -125,6 +184,68 @@ func (m *Model) transcribeChunk(samples []float32) (Result, error) {
 	}
 
 	return m.parseOutput(generated), nil
+}
+
+// decodeStep runs one decoder.Step and returns vocabSize-length logits
+// either way, regardless of whether the graph itself projects to vocab
+// space or leaves that to projectLogits -- see textDecoder.hiddenOutput.
+func (m *Model) decodeStep(cache *kvCache, inputsEmbeds []float32, seqLen int) ([]float32, error) {
+	out, err := m.decoder.Step(cache, inputsEmbeds, seqLen, m.cfg.HiddenSize)
+	if err != nil {
+		return nil, err
+	}
+	if m.decoder.hiddenOutput {
+		return m.projectLogits(out), nil
+	}
+	return out, nil
+}
+
+// projectLogits computes vocabSize logits from a single hiddenSize hidden
+// state by dotting it against every row of the embedding matrix -- the
+// manual equivalent of the nn.Linear(hidden_size, vocab_size, bias=False)
+// lm_head a tied-embedding model's decoder.onnx no longer bakes in (see
+// config.TieWordEmbeddings). embed_tokens.weight and lm_head.weight are the
+// same matrix in such a checkpoint, and m.embed is already that matrix
+// (loaded once for input embedding lookups), so this reuses it instead of
+// the graph carrying a second copy just for the output side. Parallelized
+// across GOMAXPROCS workers: vocabSize (151936) x hiddenSize floats is tens
+// of MB streamed through memory on every single decode step, and this runs
+// once per generated token.
+func (m *Model) projectLogits(hidden []float32) []float32 {
+	vocab := m.cfg.VocabSize
+	hiddenSize := m.cfg.HiddenSize
+	logits := make([]float32, vocab)
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > vocab {
+		workers = 1
+	}
+	chunk := (vocab + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if start >= vocab {
+			break
+		}
+		if end > vocab {
+			end = vocab
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for v := start; v < end; v++ {
+				row := m.embed[v*hiddenSize : (v+1)*hiddenSize : (v+1)*hiddenSize]
+				var sum float32
+				for h, hv := range hidden {
+					sum += hv * row[h]
+				}
+				logits[v] = sum
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	return logits
 }
 
 // embedRow returns the hiddenSize-length embedding row for token id (no

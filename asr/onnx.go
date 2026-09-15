@@ -149,9 +149,17 @@ type textDecoder struct {
 	headDim    int
 	inputNames []string
 	outNames   []string
+	// hiddenOutput is true when the graph's first output is the raw
+	// hidden_size-length hidden state rather than a projected
+	// vocabSize-length logits row -- true for a tied-embedding model, whose
+	// export skips baking a redundant copy of embed_tokens.weight into the
+	// graph as lm_head (see export_decoder.py). Step returns whichever one
+	// the graph produces unchanged; the caller (transcribeChunk) is the one
+	// that knows to run Model.projectLogits when this is set.
+	hiddenOutput bool
 }
 
-func loadTextDecoder(path string, numLayers, numKVHeads, headDim, intraOpThreads int) (*textDecoder, error) {
+func loadTextDecoder(path string, numLayers, numKVHeads, headDim int, hiddenOutput bool, intraOpThreads int) (*textDecoder, error) {
 	if err := initRuntime(); err != nil {
 		return nil, fmt.Errorf("asr: onnx runtime unavailable: %w", err)
 	}
@@ -161,10 +169,14 @@ func loadTextDecoder(path string, numLayers, numKVHeads, headDim, intraOpThreads
 	}
 	defer opts.Destroy()
 
+	firstOut := "logits"
+	if hiddenOutput {
+		firstOut = "hidden_states"
+	}
 	inNames := make([]string, 0, 2+2*numLayers)
 	outNames := make([]string, 0, 1+2*numLayers)
 	inNames = append(inNames, "inputs_embeds", "attention_mask")
-	outNames = append(outNames, "logits")
+	outNames = append(outNames, firstOut)
 	for i := 0; i < numLayers; i++ {
 		inNames = append(inNames, fmt.Sprintf("past_key_%d", i), fmt.Sprintf("past_value_%d", i))
 		outNames = append(outNames, fmt.Sprintf("present_key_%d", i), fmt.Sprintf("present_value_%d", i))
@@ -176,7 +188,7 @@ func loadTextDecoder(path string, numLayers, numKVHeads, headDim, intraOpThreads
 	}
 	return &textDecoder{
 		session: session, numLayers: numLayers, numKVHeads: numKVHeads, headDim: headDim,
-		inputNames: inNames, outNames: outNames,
+		inputNames: inNames, outNames: outNames, hiddenOutput: hiddenOutput,
 	}, nil
 }
 
@@ -231,12 +243,13 @@ func (c *kvCache) Destroy() {
 // Step runs one decoder forward pass: inputsEmbeds is (seqLen, hidden)
 // row-major for a single batch item. Attention covers cache.Len()+seqLen
 // positions (no padding is ever used, generation is always a single
-// unpadded sequence). The exported graph only ever projects the *last*
-// position through lm_head (multi-position prefill logits are never used by
-// a greedy decode loop, so computing them would be pure waste), so the
-// returned logits is always exactly one vocabSize-length row regardless of
-// seqLen. Replaces cache's tensors in place with the updated (grown) ones,
-// destroying the old tensors.
+// unpadded sequence). The exported graph only ever carries the *last*
+// position forward past that point (multi-position prefill output is never
+// used by a greedy decode loop, so computing it would be pure waste), so the
+// returned slice is always exactly one row regardless of seqLen -- either
+// vocabSize-length logits, or hiddenSize-length hidden state if
+// d.hiddenOutput (see its doc comment). Replaces cache's tensors in place
+// with the updated (grown) ones, destroying the old tensors.
 func (d *textDecoder) Step(cache *kvCache, inputsEmbeds []float32, seqLen, hidden int) ([]float32, error) {
 	embedsT, err := ort.NewTensor(ort.NewShape(1, int64(seqLen), int64(hidden)), inputsEmbeds)
 	if err != nil {
@@ -267,19 +280,19 @@ func (d *textDecoder) Step(cache *kvCache, inputsEmbeds []float32, seqLen, hidde
 		return nil, fmt.Errorf("asr: running decoder step: %w", err)
 	}
 
-	logitsT, ok := outputs[0].(*ort.Tensor[float32])
+	outT, ok := outputs[0].(*ort.Tensor[float32])
 	if !ok {
 		for _, o := range outputs {
 			if o != nil {
 				o.Destroy()
 			}
 		}
-		return nil, fmt.Errorf("asr: unexpected decoder logits type %T", outputs[0])
+		return nil, fmt.Errorf("asr: unexpected decoder first-output type %T", outputs[0])
 	}
-	logitsData := logitsT.GetData()
-	logits := make([]float32, len(logitsData))
-	copy(logits, logitsData)
-	logitsT.Destroy()
+	outData := outT.GetData()
+	out := make([]float32, len(outData))
+	copy(out, outData)
+	outT.Destroy()
 
 	for i := 0; i < d.numLayers; i++ {
 		newKey, ok := outputs[1+2*i].(*ort.Tensor[float32])
@@ -295,7 +308,7 @@ func (d *textDecoder) Step(cache *kvCache, inputsEmbeds []float32, seqLen, hidde
 		cache.keys[i] = newKey
 		cache.values[i] = newVal
 	}
-	return logits, nil
+	return out, nil
 }
 
 func (d *textDecoder) Close() error {

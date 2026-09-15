@@ -25,6 +25,16 @@ type config struct {
 	HeadDim     int `json:"-"`
 	AudioOutDim int `json:"-"`
 	VocabSize   int `json:"-"`
+
+	// TieWordEmbeddings mirrors thinker_config.text_config.tie_word_embeddings
+	// -- true for kitten-asr-small-enhanced, false for kitten-asr-tiny. When
+	// true, lm_head.weight is the same matrix as embed_tokens.weight in the
+	// original checkpoint, so decoder.onnx's export (see export_decoder.py)
+	// skips baking a second copy of it into the graph: the decoder outputs
+	// raw hidden states instead of projected logits, and Model.projectLogits
+	// does the final vocab projection using the embed matrix this package
+	// already loads for input embedding lookups (see textDecoder.hiddenOutput).
+	TieWordEmbeddings bool `json:"-"`
 }
 
 type rawConfig struct {
@@ -40,11 +50,12 @@ type rawConfig struct {
 			OutputDim  int `json:"output_dim"`
 		} `json:"audio_config"`
 		TextConfig struct {
-			HiddenSize       int `json:"hidden_size"`
-			NumHiddenLayers  int `json:"num_hidden_layers"`
-			NumKeyValueHeads int `json:"num_key_value_heads"`
-			HeadDim          int `json:"head_dim"`
-			VocabSize        int `json:"vocab_size"`
+			HiddenSize        int  `json:"hidden_size"`
+			NumHiddenLayers   int  `json:"num_hidden_layers"`
+			NumKeyValueHeads  int  `json:"num_key_value_heads"`
+			HeadDim           int  `json:"head_dim"`
+			VocabSize         int  `json:"vocab_size"`
+			TieWordEmbeddings bool `json:"tie_word_embeddings"`
 		} `json:"text_config"`
 	} `json:"thinker_config"`
 }
@@ -72,6 +83,7 @@ func loadConfig(dir string) (*config, error) {
 		NumKVHeads:        raw.ThinkerConfig.TextConfig.NumKeyValueHeads,
 		HeadDim:           raw.ThinkerConfig.TextConfig.HeadDim,
 		VocabSize:         raw.ThinkerConfig.TextConfig.VocabSize,
+		TieWordEmbeddings: raw.ThinkerConfig.TextConfig.TieWordEmbeddings,
 	}, nil
 }
 

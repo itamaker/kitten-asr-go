@@ -5,9 +5,56 @@ import "fmt"
 // DefaultStreamWindowSeconds and DefaultStreamMinTriggerSeconds are the
 // defaults NewStream uses when the corresponding StreamOptions field is
 // zero. See StreamOptions for what they trade off.
+//
+// Measured (not guessed) against kitten-asr-tiny on a synthetic ~30s
+// espeak-ng clip, sweeping each axis independently:
+//
+//	window  trigger  passes  wall     final WER
+//	10s     1.5s     19      2m49s    72.9%
+//	20s     0.75s    37      7m26s    40.0%
+//	20s     1.5s     19      3m29s    40.0%
+//	20s     3.0s     10      2m04s    40.0%
+//	30s     1.5s     19      4m20s    20.0%
+//
+// Two independent findings fell out of that grid:
+//
+//  1. Final (post-Flush) accuracy tracks WindowSeconds, not
+//     MinTriggerSeconds: WER was identical (40.0%) across 0.75s/1.5s/3.0s
+//     triggers at a fixed 20s window, but dropped sharply with a bigger
+//     window at a fixed 1.5s trigger (72.9% at 10s, 40.0% at 20s, 20.0% at
+//     30s -- more window means more acoustic/textual context per
+//     re-transcription pass). MinTriggerSeconds only trades update latency
+//     for cost; it has no measured effect on final transcript quality.
+//  2. Per-pass cost grows *sublinearly* with WindowSeconds (about 9s/pass at
+//     10s, 11-12s/pass at 20s, 14s/pass at 30s) because the audio encoder
+//     always runs on a fixed, silence-padded 30s input regardless of how
+//     much of the window is real audio (see MaxAudioSeconds) -- only the
+//     decode step count, which scales with actual spoken content, grows
+//     with window size, and that's a smaller effect than the encoder's flat
+//     cost.
+//
+// Together these say: prefer the largest window (MaxAudioSeconds) for
+// accuracy, since it's not much more expensive than a smaller one and a
+// smaller window has no compensating benefit. 20.0 was an untuned guess (see
+// this repo's history); 30.0 measurably halves WER over that guess for
+// well under double the per-pass cost. MinTriggerSeconds moved from 1.5 to
+// 2.0 alongside it to keep total compute load per second of audio roughly
+// flat despite the pricier window (13.7s/2.0s ~= 6.9x vs the old 11.5s/1.5s
+// ~= 7.7x) -- pick a larger value than this if your workload is more
+// latency-sensitive than compute-sensitive, since accuracy doesn't depend on
+// it either way.
+//
+// Caveat: even the cheapest setting measured here runs several times slower
+// than real-time on CPU with kitten-asr-tiny -- these two knobs trade
+// accuracy against an already-not-real-time cost, they don't make Stream
+// real-time-capable. That needs faster inference (e.g. quantization) or a
+// smaller/faster model, not different windowing. This grid also wasn't
+// repeated against kitten-asr-small-enhanced (larger, slower per pass) or
+// against real (non-synthetic) speech -- both are likely to shift the exact
+// numbers, if not the qualitative shape of the tradeoff.
 const (
-	DefaultStreamWindowSeconds     = 20.0
-	DefaultStreamMinTriggerSeconds = 1.5
+	DefaultStreamWindowSeconds     = 30.0
+	DefaultStreamMinTriggerSeconds = 2.0
 )
 
 // StreamOptions configures a Stream's windowing/triggering behavior.
