@@ -14,7 +14,11 @@
 # Usage:
 #   scripts/fetch_model.sh [name]
 #
-#   name ∈ { tiny (default), small-enhanced }
+#   name ∈ { tiny (default), small-enhanced, tiny-int8, small-enhanced-int8 }
+#
+#   The "-int8" variants are dynamically-quantized (see tools/quantize.py
+#   and the README's "Dynamic int8 quantization" section for the measured
+#   size/accuracy tradeoff) -- smaller download, not a default choice.
 #
 # Environment:
 #   HF_TOKEN  Optional. Only needed if you're rate-limited as an anonymous
@@ -28,11 +32,18 @@ cd "$REPO_ROOT"
 
 NAME="${1:-tiny}"
 
-# name → (Hugging Face repo, on-disk file prefix). The file prefix matches
+INT8=0
+MODEL="$NAME"
+if [[ "$NAME" == *-int8 ]]; then
+  INT8=1
+  MODEL="${NAME%-int8}"
+fi
+
+# model → (Hugging Face repo, on-disk file prefix). The file prefix matches
 # KittenML's own ONNX naming convention on the TTS side (e.g.
 # kitten_tts_nano_v0_8.onnx) -- underscores, model name baked into the
 # filename itself.
-case "$NAME" in
+case "$MODEL" in
   tiny)
     HF_REPO="zhaoyang-jia/kitten-asr-tiny-onnx"
     PREFIX="kitten_asr_tiny"
@@ -42,12 +53,17 @@ case "$NAME" in
     PREFIX="kitten_asr_small_enhanced"
     ;;
   *)
-    echo "Unknown model '$NAME'. Choose: tiny, small-enhanced" >&2
+    echo "Unknown model '$NAME'. Choose: tiny, small-enhanced, tiny-int8, small-enhanced-int8" >&2
     exit 1
     ;;
 esac
+[[ "$INT8" == 1 ]] && HF_REPO="${HF_REPO}-int8"
 
-DEST="models/kitten-asr-${NAME}-onnx"
+if [[ "$INT8" == 1 ]]; then
+  DEST="models/kitten-asr-${MODEL}-onnx-int8"
+else
+  DEST="models/kitten-asr-${MODEL}-onnx"
+fi
 BASE="https://huggingface.co/${HF_REPO}/resolve/main"
 
 if [[ -f "$DEST/config.json" && "${FORCE:-0}" != "1" ]]; then
@@ -67,15 +83,27 @@ fetch() { # <remote-name>
 }
 
 # Fixed file list -- unlike kitten-tts-go's models, these aren't named
-# dynamically from a manifest, the export pipeline (tools/export_*.py)
-# always produces exactly these names (given the prefix above).
-# decoder.onnx.data (the decoder's external-data companion) is deliberately
-# NOT prefixed: ONNX Runtime resolves it via the location string recorded
-# inside "${PREFIX}_decoder.onnx" itself (always literally "decoder.onnx.data"
-# regardless of what the .onnx file is named), not by matching filenames.
-for f in config.json vocab.json merges.txt added_tokens.json \
-         "${PREFIX}_audio_encoder.onnx" "${PREFIX}_decoder.onnx" \
-         decoder.onnx.data "${PREFIX}_embed_tokens.bin"; do
+# dynamically from a manifest, the export pipeline (tools/export_*.py /
+# tools/quantize.py) always produces exactly these names (given the prefix
+# above), but the fp32 and int8 layouts differ in two ways:
+#   - fp32's audio_encoder has no external-data companion at all (small
+#     enough to embed inline); int8's does, because quantize_dynamic always
+#     writes one when use_external_data_format=True.
+#   - fp32's decoder companion is deliberately unprefixed ("decoder.onnx.data"
+#     literally, regardless of what the .onnx file is named -- ONNX Runtime
+#     resolves it via the location string recorded inside "${PREFIX}_decoder.onnx"
+#     itself, not by matching filenames); quantize_dynamic instead names the
+#     int8 decoder's companion after its own output filename
+#     ("${PREFIX}_decoder.onnx.data"), so that's the name to fetch there.
+FILES=(config.json vocab.json merges.txt added_tokens.json
+       "${PREFIX}_audio_encoder.onnx" "${PREFIX}_decoder.onnx"
+       "${PREFIX}_embed_tokens.bin")
+if [[ "$INT8" == 1 ]]; then
+  FILES+=("${PREFIX}_audio_encoder.onnx.data" "${PREFIX}_decoder.onnx.data")
+else
+  FILES+=(decoder.onnx.data)
+fi
+for f in "${FILES[@]}"; do
   fetch "$f"
 done
 
