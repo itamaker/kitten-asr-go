@@ -18,6 +18,7 @@ Usage:
 Example:
     python3 tools/quantize.py models/kitten-asr-tiny-onnx models/kitten-asr-tiny-onnx-int8
 """
+import gc
 import glob
 import os
 import shutil
@@ -51,6 +52,15 @@ def main():
     for suffix in ["_audio_encoder.onnx", "_decoder.onnx"]:
         src = _find_one(src_dir, suffix)
         dst = os.path.join(dst_dir, os.path.basename(src))
+        # A rerun into the same dst_dir (e.g. resuming after an interrupted
+        # pass) must start from a clean slate: onnx's external-data writer
+        # opens the destination's .data file for append, not truncate, so a
+        # leftover file from a prior attempt silently doubles up instead of
+        # being replaced.
+        if os.path.exists(dst):
+            os.remove(dst)
+        if os.path.exists(dst + ".data"):
+            os.remove(dst + ".data")
         print(f"Quantizing {src} -> {dst} ...")
         before = os.path.getsize(src)
         # decoder.onnx's external-data companion isn't <basename>.data -- it's
@@ -88,6 +98,14 @@ def main():
                 save_as_external_data=True, all_tensors_to_one_file=True,
                 location=os.path.basename(preprocessed) + ".data",
             )
+            # quantize_dynamic reloads model_input from disk into a second,
+            # independent copy before quantizing it -- without dropping this
+            # one first, the decoder (~1.7GB of fp32 weights) briefly needs
+            # both copies plus quantization scratch space resident at once,
+            # which is enough to OOM a memory-constrained sandbox (WSL2's
+            # default VM cap, e.g.).
+            del model
+            gc.collect()
             quantize_dynamic(
                 model_input=preprocessed,
                 model_output=dst,
